@@ -1,0 +1,7 @@
+name = "CLOUD18_AP_Analysis"
+uuid = "081e4692-7218-4e83-a265-d8c990d5ad5d"
+authors = ["Timo Wittler wittler.timo@uibk.ac.at"]
+version = "1.0.0-DEV"
+
+[compat]
+julia = "1.11.3"
