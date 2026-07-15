@@ -1,3 +1,6 @@
 [deps]
 CLOUD18_AP_Analysis = "081e4692-7218-4e83-a265-d8c990d5ad5d"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+
+[compat]
+Documenter = "1.17.0"
