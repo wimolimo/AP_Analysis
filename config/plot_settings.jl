@@ -5,15 +5,15 @@ const PAPER_STACKED_PANEL_HEIGHT = 270
 const PAPER_UNSTACKED_SIZE = (PAPER_PLOT_WIDTH, 400)
 const PAPER_STACKED_SIZE(n_channels::Integer) = (PAPER_PLOT_WIDTH, PAPER_STACKED_PANEL_HEIGHT * n_channels)
 const PLOT_PX_PER_UNIT = 6 # pixels per unit for saving figures
-const PAPER_LINE_COLORS = [
-    "#332288",
-    "#117733",
-    "#44AA99",
-    "#88CCEE",
-    "#DDCC77",
-    "#CC6677",
-    "#AA4499",
-    "#882255",
+PAPER_LINE_COLORS = [
+    "#0072B2",  # blue
+    "#D55E00",  # vermillion
+    "#009E73",  # green
+    "#E69F00",  # orange
+    "#56B4E9",  # sky blue
+    "#CC79A7",  # pink
+    "#F0E442",  # yellow
+    "#000000",  # black
 ]
 
 ANALYSIS_THEME = Theme(
