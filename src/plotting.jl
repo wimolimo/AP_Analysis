@@ -1,3 +1,8 @@
+using CLOUD18_AP_Analysis
+using Statistics: quantile
+
+const _STAGES_DATA = Ref{Vector{Any}}(Any[])
+
 _normalize_channel_key(channel::Channel) = channel.name
 _normalize_channel_key(channel::AbstractString) = String(channel)
 _normalize_channel_key(channel::Symbol) = String(channel)
@@ -7,13 +12,32 @@ function _channel_datetimes(ch::Channel)
     return [isnan(t) ? DateTime(0) : epoch + Millisecond(round(Int, t)) for t in ch.time]
 end
 
-function _present(fig; interactive::Bool=false)
+function _present(fig; interactive::Bool=false, savepath::Union{Nothing,String}=nothing)
     if interactive
         GLMakie.closeall()
         screen = display(GLMakie.Screen(), fig)
         wait(screen)
     else
-        display(fig)
+        # Non-interactive: save to file. Prefer provided savepath, otherwise use display.png
+        filepath = savepath !== nothing ? savepath : "display.png"
+        try
+            save(filepath, fig, px_per_unit=PLOT_PX_PER_UNIT)
+            @info "Figure saved to $filepath"
+        catch err
+            @warn "Failed to save figure to $filepath: $err"
+        end
+        # Try to open the saved file with the OS default image viewer
+        try
+            if Sys.iswindows()
+                run(`cmd /C start "" "$(filepath)"`)
+            elseif Sys.isapple()
+                run(`open "$(filepath)"`)
+            else
+                run(`xdg-open "$(filepath)"`)
+            end
+        catch err
+            @warn "Failed to open $filepath with default viewer: $err"
+        end
     end
     return nothing
 end
@@ -27,6 +51,34 @@ function _resolve_channels(data::Dataset, requested_channels)
     return [requested isa Channel ? requested : data.channels[_normalize_channel_key(requested)] for requested in requested_channels]
 end
 
+_is_dual_axis(ch_spec) = isa(ch_spec, Tuple) && length(ch_spec) == 2
+
+# Track which backend we've activated to avoid redundant activate! calls
+const _ACTIVE_BACKEND = Ref{Symbol}(:cairo)
+
+"""
+set_plot_backend!(b)
+Set the active plotting backend for subsequent plotting calls. `b` may be
+:cairo or :gl. This avoids repeated backend activation when plotting many
+figures in a script.
+"""
+function set_plot_backend!(b::Symbol)
+    if b == :gl || b == :glmakie || b == :GLMakie
+        GLMakie.activate!()
+        _ACTIVE_BACKEND[] = :gl
+    elseif b == :cairo || b == :CairoMakie
+        CairoMakie.activate!()
+        _ACTIVE_BACKEND[] = :cairo
+    else
+        throw(ArgumentError("Unknown backend: $b (use :gl or :cairo)"))
+    end
+    try
+        set_theme!(ANALYSIS_THEME)
+    catch
+    end
+    return nothing
+end
+
 function _pick_colors(n::Int)
     palette = PAPER_LINE_COLORS
     np = length(palette)
@@ -37,65 +89,36 @@ function _pick_colors(n::Int)
     return [palette[i] for i in indices]
 end
 
-function _auto_ylims!(backend, ax, xlims)
-    xl = (Dates.datetime2unix(xlims[1]) * 1000, Dates.datetime2unix(xlims[2]) * 1000)
-    ymin, ymax = Inf, -Inf
-    for plot in ax.scene.plots
-        if hasproperty(plot, :input_args) && length(plot.input_args) >= 2
-            xs = plot.input_args[1][]
-            ys = plot.input_args[2][]
-            for (x, y) in zip(xs, ys)
-                xval = x isa DateTime ? Dates.datetime2unix(x) * 1000 : Float64(x)
-                if xl[1] <= xval <= xl[2] && isfinite(y)
-                    ymin = min(ymin, y)
-                    ymax = max(ymax, y)
-                end
-            end
-        end
+function _plot_on_axis!(ax, channels::Vector{Channel}, colors, offset::Int=0; datetimes_cache=nothing)
+    entries = []
+    for (j, ch) in enumerate(channels)
+        color = colors[offset + j]
+        dts = datetimes_cache !== nothing ? datetimes_cache[j] : _channel_datetimes(ch)
+        p = lines!(ax, dts, ch.values;
+            label = ch.name,
+            color = color,
+        )
+        push!(entries, (p, ch.name))
     end
-    if isfinite(ymin) && isfinite(ymax)
-        margin = (ymax - ymin) * 0.05
-        margin = margin == 0 ? 1.0 : margin
-        backend.ylims!(ax, (ymin - margin, ymax + margin))
-    end
-end
-
-function _parse_panel_ylabel(ylabels, i::Int, is_dual::Bool)
-    if ylabels === nothing || i > length(ylabels) || ylabels[i] === nothing
-        return ("", "")
-    end
-    yl = ylabels[i]
-    if isa(yl, Tuple) && length(yl) == 2
-        return (something(yl[1], ""), something(yl[2], ""))
-    end
-    return (String(yl), "")
+    return entries
 end
 
 """
-Check if a channel spec is a dual-axis tuple: (left_channels, right_channels)
-"""
-_is_dual_axis(ch_spec) = isa(ch_spec, Tuple) && length(ch_spec) == 2
-
-"""
-Parse ylims for a panel. Returns (left_ylims, right_ylims).
-- nothing → (nothing, nothing)
-- (lo, hi)::Tuple{Number,Number} → ((lo,hi), nothing)  — single axis
-- (left, right)::Tuple where either is nothing or a tuple of numbers → dual axis ylims
+Parse ylims for a panel. Returns `(left_ylims, right_ylims)`.
+- `nothing` → `(nothing, nothing)`
+- `(lo, hi)::Tuple{Number,Number}` → `( (lo,hi), nothing )` for single-axis
+- For dual-axis, accept `(left, right)` where either may be `nothing` or a `(lo,hi)` tuple.
 """
 function _parse_panel_ylims(yl, is_dual::Bool)
     yl === nothing && return (nothing, nothing)
     if !is_dual
-        # For single-axis panels, yl should be a simple (lo, hi) or nothing
-        # If someone passes a dual-style ylims to a non-dual panel, use the first element
         if isa(yl, Tuple) && length(yl) == 2 && !all(x -> x isa Number, yl)
             return (yl[1], nothing)
         end
         return (yl, nothing)
     end
-    # Dual axis
     if isa(yl, Tuple) && length(yl) == 2
         if all(x -> x isa Number, yl)
-            # (lo, hi) — treat as left-axis only
             return (yl, nothing)
         else
             return (yl[1], yl[2])
@@ -104,21 +127,109 @@ function _parse_panel_ylims(yl, is_dual::Bool)
     return (yl, nothing)
 end
 
-"""
-Plot channels on an axis (left or right), returns the plotted colors for legend building.
-"""
-function _plot_on_axis!(backend, ax, channels::Vector{Channel}, colors, offset::Int=0; datetimes_cache=nothing)
-    entries = []
-    for (j, ch) in enumerate(channels)
-        color = colors[offset + j]
-        dts = datetimes_cache !== nothing ? datetimes_cache[j] : _channel_datetimes(ch)
-        p = backend.lines!(ax, dts, ch.values;
-            label = ch.name,
-            color = color,
-        )
-        push!(entries, (p, ch.name))
+function _append_to_filename(path::String, tag::String)
+    isempty(tag) && return path
+    dir = dirname(path)
+    base, ext = splitext(basename(path))
+    return joinpath(dir, "$(base)_$(tag)$(ext)")
+end
+
+function _smoothing_label(window::Period)
+    ms = Dates.value(Millisecond(window))
+    if ms >= 3600000 && ms % 3600000 == 0
+        return "avg$(ms ÷ 3600000)h"
+    elseif ms >= 60000 && ms % 60000 == 0
+        return "avg$(ms ÷ 60000)min"
+    elseif ms >= 1000 && ms % 1000 == 0
+        return "avg$(ms ÷ 1000)s"
+    else
+        return "avg$(ms)ms"
     end
-    return entries
+end
+_smoothing_label(::Nothing) = ""
+
+"""
+Get the label string for a stage.
+"""
+function _get_stage_label(stage::Dict, label_key)
+    if label_key === nothing || label_key == "stage"
+        return stage["stage"]
+    elseif label_key == "type"
+        return "$(stage["stage"]): $(stage["type"])"
+    elseif label_key == "onlytype"
+        return "$(stage["type"])"
+    elseif label_key == "description"
+        desc = stage["description"]
+        return isempty(desc) ? stage["stage"] : "$(stage["stage"]): $desc"
+    elseif label_key == "comments"
+        c = stage["comments"]
+        return isempty(c) ? stage["stage"] : "$(stage["stage"]): $c"
+    elseif label_key == "details"
+        d = join(stage["details"], "\n")
+        return isempty(d) ? stage["stage"] : "$(stage["stage"]): $d"
+    elseif label_key == "full"
+        parts = filter(!isempty, [stage["stage"], stage["type"], stage["description"]])
+        return join(parts, " - ")
+    else
+        return stage["stage"]
+    end
+end
+
+function _truncate(s::String, maxlen::Int=40)
+    length(s) <= maxlen && return s
+    return s[1:maxlen] * "…"
+end
+
+function load_stages!(filepath::String)
+    _STAGES_DATA[] = parse_cloud_log(filepath)
+    println("Loaded $(length(_STAGES_DATA[])) stages")
+end
+
+function _unpack_stages(stages)
+    stages === nothing && return (nothing, nothing)
+    isempty(_STAGES_DATA[]) && (@warn("No stages loaded. Call load_stages!(filepath) first."); return (nothing, nothing))
+    if stages === true
+        return (_STAGES_DATA[], nothing)
+    else
+        return (_STAGES_DATA[], stages)
+    end
+end
+
+"""
+Draw stage vertical lines and labels on a single axis.
+"""
+function _draw_stages!(ax, stages; xlims=nothing)
+    stages_data, label_key = _unpack_stages(stages)
+    stages_data === nothing && return
+
+    s = STAGE_SETTINGS
+    yl = ax.finallimits[].origin[2], ax.finallimits[].origin[2] + ax.finallimits[].widths[2]
+    dt_offset = if xlims !== nothing
+        Millisecond(round(Int, Dates.value(Millisecond(xlims[2] - xlims[1])) * s.text_offset))
+    else
+        Millisecond(60000)
+    end
+
+    for stage in stages_data
+        t = stage["time"]
+        t === nothing && continue
+        if xlims !== nothing
+            (t < xlims[1] || t > xlims[2]) && continue
+        end
+
+        label = _truncate(_get_stage_label(stage, label_key), s.max_length)
+
+        lines!(ax, [t, t], [yl[1], yl[2]];
+            color=s.line_color, linewidth=s.line_width, linestyle=s.line_style)
+
+        text!(ax, t + dt_offset, yl[1] + 0.02 * (yl[2] - yl[1]);
+            text=label,
+            rotation=π / 2,
+            fontsize=s.font_size,
+            color=s.font_color,
+            align=(:left, :top),
+        )
+    end
 end
 
 function _padded_ylims(ymin, ymax)
@@ -159,91 +270,36 @@ function _compute_ylims_from_channels(channels::Vector{Channel}, xlims)
     return _padded_ylims(ymin, ymax)
 end
 
-function _apply_ylims!(backend, ax, yl, channels::Vector{Channel}, xlims)
+function _apply_ylims!(ax, yl, channels::Vector{Channel}, xlims)
     if yl !== nothing
-        backend.ylims!(ax, yl)
+        ylims!(ax, yl)
     else
         computed = _compute_ylims_from_channels(channels, xlims)
-        computed !== nothing && backend.ylims!(ax, computed)
+        computed !== nothing && ylims!(ax, computed)
     end
 end
-
-function _plot_channels(channels::Vector{Channel};
-        title = "Overview",
-        savepath = nothing,
-        stacked = false,
-        interactive::Bool=false,
-        xlims = nothing,
-        ylims = nothing,
-        smoothing = nothing,
-    )
-    channels = _maybe_smooth(channels, smoothing)
-    colors = _pick_colors(length(channels))
-    backend = interactive ? GLMakie : CairoMakie
-    backend.activate!()
-
-    if stacked
-        fig = backend.Figure(size=PAPER_STACKED_SIZE(length(channels)))
-        for (i, ch) in enumerate(channels)
-            ax = backend.Axis(fig[i,1];
-                ylabel = ch.name,
-                xlabel = i == length(channels) ? "Time (UTC)" : "",
-                title  = i == 1 ? title : "",
-            )
-            backend.lines!(ax, _channel_datetimes(ch), ch.values; color=colors[mod1(i, length(colors))])
-            xlims !== nothing && backend.xlims!(ax, xlims)
-            yl = if ylims !== nothing
-                isa(ylims, AbstractVector) ? ylims[i] : ylims
-                else
-                    nothing
-                end
-                _apply_ylims!(backend, ax, yl, [ch], xlims)
-        end
-    else
-        fig = backend.Figure(size=PAPER_UNSTACKED_SIZE)
-        ax = backend.Axis(fig[1,1]; title, xlabel="Time (UTC)")
-        for (i, ch) in enumerate(channels)
-            backend.lines!(ax, _channel_datetimes(ch), ch.values;
-                label = ch.name,
-                color = colors[i],
-            )
-        end
-        backend.axislegend(ax, position=:rt)
-        xlims !== nothing && backend.xlims!(ax, xlims)
-            # Replace: ylims !== nothing && backend.ylims!(ax, ylims)
-        _apply_ylims!(backend, ax, ylims, channels, xlims)
-    end
-
-    savepath !== nothing && backend.save(savepath, fig, px_per_unit=PLOT_PX_PER_UNIT)
-    return _present(fig; interactive=interactive)
-end
-
 
 function _smooth_channel(ch::Channel, window::Period)
     n = length(ch.time)
     smoothed = fill(NaN, n)
     half_w = Dates.value(Millisecond(window)) / 2.0
 
-    # Get valid indices sorted by time
     valid = [i for i in 1:n if !isnan(ch.time[i]) && isfinite(ch.values[i])]
     sort!(valid, by=i -> ch.time[i])
 
     nv = length(valid)
     nv == 0 && return Channel(ch.name, ch.time, smoothed)
 
-    # Also need output for indices with valid time but NaN values
     all_valid_time = [i for i in 1:n if !isnan(ch.time[i])]
     sort!(all_valid_time, by=i -> ch.time[i])
 
-    # Build running sum over the sorted valid (finite-value) indices
-    # For each output point, find the window using two pointers into `valid`
     lo = 1
     hi = 0
     running_sum = 0.0
     running_count = 0
 
-    vi = 1  # pointer into valid array for lo
-    vj = 0  # pointer into valid array for hi
+    vi = 1
+    vj = 0
 
     for k in eachindex(all_valid_time)
         i = all_valid_time[k]
@@ -251,13 +307,11 @@ function _smooth_channel(ch::Channel, window::Period)
         t_lo = t - half_w
         t_hi = t + half_w
 
-        # Advance hi
         while vj < nv && ch.time[valid[vj + 1]] <= t_hi
             vj += 1
             running_sum += ch.values[valid[vj]]
             running_count += 1
         end
-        # Advance lo
         while vi <= vj && ch.time[valid[vi]] < t_lo
             running_sum -= ch.values[valid[vi]]
             running_count -= 1
@@ -273,6 +327,94 @@ _maybe_smooth(ch::Channel, ::Nothing) = ch
 _maybe_smooth(ch::Channel, window::Period) = _smooth_channel(ch, window)
 _maybe_smooth(channels::Vector{Channel}, window) = [_maybe_smooth(ch, window) for ch in channels]
 
+function _activate_backend!(interactive::Bool; backend_override::Union{Nothing,Symbol}=nothing)
+    # Determine desired backend: override if provided, otherwise use interactive flag
+    desired = backend_override !== nothing ? backend_override : (interactive ? :gl : :cairo)
+
+    # Only activate if different from currently tracked backend
+    if _ACTIVE_BACKEND[] != desired
+        try
+            if desired == :gl
+                GLMakie.activate!()
+                _ACTIVE_BACKEND[] = :gl
+            else
+                CairoMakie.activate!()
+                _ACTIVE_BACKEND[] = :cairo
+            end
+        catch err
+            @warn("Failed to activate backend: $err")
+        end
+
+        # Reapply the package theme if available so activation doesn't override it.
+        try
+            set_theme!(ANALYSIS_THEME)
+        catch
+            # ignore
+        end
+    end
+    return nothing
+end
+
+function _plot_channels(channels::Vector{Channel};
+        title = "Overview",
+        savepath = nothing,
+        stacked = false,
+        interactive::Bool=false,
+        xlims = nothing,
+        ylims = nothing,
+        smoothing = nothing,
+        stages = nothing,
+    )
+    channels = _maybe_smooth(channels, smoothing)
+
+    stag = _smoothing_label(smoothing)
+    if !isempty(stag)
+        title = "$title ($stag)"
+        savepath = savepath !== nothing ? _append_to_filename(savepath, stag) : nothing
+    end
+
+    colors = _pick_colors(length(channels))
+    _activate_backend!(interactive)
+
+    if stacked
+        fig = Figure(size=PAPER_STACKED_SIZE(length(channels)))
+        for (i, ch) in enumerate(channels)
+            ax = Axis(fig[i,1];
+                ylabel = ch.name,
+                xlabel = i == length(channels) ? "Time (UTC)" : "",
+                title  = i == 1 ? title : "",
+            )
+            lines!(ax, _channel_datetimes(ch), ch.values; color=colors[mod1(i, length(colors))])
+            xlims !== nothing && Makie.xlims!(ax, xlims)
+            yl = if ylims !== nothing
+                isa(ylims, AbstractVector) ? ylims[i] : ylims
+            else
+                nothing
+            end
+            _apply_ylims!(ax, yl, [ch], xlims)
+
+            stages !== nothing && _draw_stages!(ax, stages; xlims=xlims)
+        end
+    else
+        fig = Figure(size=PAPER_UNSTACKED_SIZE)
+        ax = Axis(fig[1,1]; title, xlabel="Time (UTC)")
+        for (i, ch) in enumerate(channels)
+            lines!(ax, _channel_datetimes(ch), ch.values;
+                label = ch.name,
+                color = colors[i],
+            )
+        end
+        axislegend(ax, position=:rt)
+        xlims !== nothing && Makie.xlims!(ax, xlims)
+        _apply_ylims!(ax, ylims, channels, xlims)
+
+        stages !== nothing && _draw_stages!(ax, stages; xlims=xlims)
+    end
+
+    savepath !== nothing && save(savepath, fig, px_per_unit=PLOT_PX_PER_UNIT)
+    return _present(fig; interactive=interactive, savepath=savepath)
+end
+
 function plot_channel(ch::Channel;
         ylabel = ch.name,
         title  = ch.name,
@@ -283,27 +425,42 @@ function plot_channel(ch::Channel;
         smoothing = nothing,
     )
     ch = _maybe_smooth(ch, smoothing)
-    backend = interactive ? GLMakie : CairoMakie
-    backend.activate!()
-    fig = backend.Figure()
-    ax = backend.Axis(fig[1,1]; title, xlabel="Time (UTC)", ylabel)
-    backend.lines!(ax, _channel_datetimes(ch), ch.values)
-    xlims !== nothing && backend.xlims!(ax, xlims)
-    _apply_ylims!(backend, ax, ylims, [ch], xlims)
-    savepath !== nothing && backend.save(savepath, fig, px_per_unit=PLOT_PX_PER_UNIT)
-    return _present(fig; interactive=interactive)
+
+    stag = _smoothing_label(smoothing)
+    if !isempty(stag)
+        title = "$title ($stag)"
+        savepath = savepath !== nothing ? _append_to_filename(savepath, stag) : nothing
+    end
+
+    _activate_backend!(interactive)
+    fig = Figure()
+    ax = Axis(fig[1,1]; title, xlabel="Time (UTC)", ylabel)
+    lines!(ax, _channel_datetimes(ch), ch.values)
+    xlims !== nothing && Makie.xlims!(ax, xlims)
+    _apply_ylims!(ax, ylims, [ch], xlims)
+    savepath !== nothing && save(savepath, fig, px_per_unit=PLOT_PX_PER_UNIT)
+    return _present(fig; interactive=interactive, savepath=savepath)
 end
 
-function plot_data(data_or_path; channels=nothing, stacked=false, savepath=nothing, interactive::Bool=false, xlims=nothing, ylims=nothing,
-    ylabels=nothing, smoothing = nothing)
+"""
+Plot data from dataset
+"""
+function plot_data(data_or_path; channels=nothing, stacked=false, savepath=nothing,
+        interactive::Bool=false, xlims=nothing, ylims=nothing,
+        ylabels=nothing, smoothing=nothing,
+        stages=nothing)
     if isa(data_or_path, AbstractVector)
-        return plot_datasets(data_or_path; channels=channels, savepath=savepath, interactive=interactive, xlims=xlims, ylims=ylims, ylabels=ylabels, smoothing=smoothing)
+        return plot_datasets(data_or_path; channels=channels, savepath=savepath,
+            interactive=interactive, xlims=xlims, ylims=ylims, ylabels=ylabels,
+            smoothing=smoothing, stages=stages)
     end
     
     data = isa(data_or_path, String) ? load_data(data_or_path) : data_or_path
     selected_channels = _resolve_channels(data, channels)
     title = isa(data_or_path, String) ? basename(data_or_path) : "Data"
-    return _plot_channels(selected_channels; title=title, stacked=stacked, savepath=savepath, interactive=interactive, xlims=xlims, ylims=ylims, smoothing=smoothing)
+    return _plot_channels(selected_channels; title=title, stacked=stacked, savepath=savepath,
+        interactive=interactive, xlims=xlims, ylims=ylims, smoothing=smoothing,
+        stages=stages)
 end
 
 function plot_channels(channels::Vector{Channel};
@@ -328,37 +485,104 @@ function plot_datasets(datasets::Vector;
         ylims=nothing,
         ylabels=nothing,
         smoothing=nothing,
+        stages=nothing,
     )
+    # Load any string paths, but don't force type — keep SMPSData as-is
     resolved_datasets = [isa(d, String) ? load_data(d) : d for d in datasets]
     n_datasets = length(resolved_datasets)
     
     channel_specs = if isnothing(channels)
         [nothing for _ in 1:n_datasets]
-    elseif !isnothing(channels) && isa(channels[1], AbstractVector) || _is_dual_axis(channels[1])
+    elseif isa(channels, AbstractVector) && (length(channels) == n_datasets) &&
+           (isa(channels[1], AbstractVector) || _is_dual_axis(channels[1]))
         channels
     else
         [channels for _ in 1:n_datasets]
     end
     
-    backend = interactive ? GLMakie : CairoMakie
-    backend.activate!()
+    _activate_backend!(interactive)
     fig_height = PAPER_STACKED_PANEL_HEIGHT * n_datasets
-    fig = backend.Figure(size=(PAPER_PLOT_WIDTH, fig_height))
-    
+    fig = Figure(size=(PAPER_PLOT_WIDTH, fig_height))
     left_axes = []
     right_axes = []
+    heatmap_handles = []  # track (panel_index, heatmap_object) for colorbars
     panel_left_chs = Vector{Vector{Channel}}(undef, n_datasets)
     panel_right_chs = Vector{Vector{Channel}}(undef, n_datasets)
+    has_heatmap = false
     
     for (i, (data, ch_spec)) in enumerate(zip(resolved_datasets, channel_specs))
-        # Parse ylabel for this panel
+
+        # ── HEATMAP panel for SMPSData ──────────────────────────────
+        if data isa SMPSData
+            has_heatmap = true
+
+            yl_label = if ylabels !== nothing && i <= length(ylabels)
+                isa(ylabels[i], Tuple) ? ylabels[i][1] : ylabels[i]
+            else
+                "Diameter [nm]"
+            end
+
+            ax = Axis(fig[i, 1];
+                xlabel = i == n_datasets ? "Time (UTC)" : "",
+                ylabel = yl_label,
+                yscale = log10,
+            )
+            push!(left_axes, ax)
+            push!(right_axes, nothing)
+            panel_left_chs[i] = Channel[]
+            panel_right_chs[i] = Channel[]
+
+            # Prepare concentration matrix, replacing NaN/non-positive for log scale
+            conc = copy(data.dNdlogDp)
+            for i in eachindex(conc)
+                if isnan(conc[i])
+                    continue  # stays NaN → nan_color
+                elseif !isfinite(conc[i]) || conc[i] <= 0
+                    conc[i] = 1e-30  # tiny positive → below colorrange → lowclip
+                end
+            end
+            
+            # Compute a sensible color range from positive values
+            pos_vals = filter(x -> isfinite(x) && x > 0, vec(conc))
+            crange = if !isempty(pos_vals)
+                (max(1.0, quantile(pos_vals, 0.01)), quantile(pos_vals, 0.99))
+            else
+                (1.0, 1e4)
+            end
+
+            # Convert timestamps to the same Float64 Makie uses internally for DateTime
+            time_float = Float64.(Dates.value.(data.time))
+
+            hm = heatmap!(ax, time_float, data.diameters, conc;
+                colormap = :inferno,
+                colorscale = log10,
+                colorrange = crange,
+                nan_color = :white,
+            )
+
+            # Colorbar label from ylabels tuple or default
+            cb_label = if ylabels !== nothing && i <= length(ylabels) && isa(ylabels[i], Tuple) && length(ylabels[i]) >= 2
+                ylabels[i][2]
+            else
+                "dN/dlogDp [cm⁻³]"
+            end
+            Colorbar(fig[i, 2], hm; label = cb_label, width = 15)
+            colgap!(fig.layout, 1, -46)  # 5 pixels gap between column 1 and 2
+
+            if i != n_datasets
+                hidexdecorations!(ax; label=true, ticklabels=true, ticks=false, grid=false)
+            end
+            continue
+        end
+
+        # ── LINE plot panel for Dataset ─────────────────────────────
         yl_label = if ylabels !== nothing && i <= length(ylabels)
             isa(ylabels[i], Tuple) ? ylabels[i][1] : ylabels[i]
         else
             ""
         end
         
-        ax = backend.Axis(fig[i, 1];
+        ax = Axis(fig[i, 1];
             xlabel = i == n_datasets ? "Time (UTC)" : "",
             ylabel = yl_label !== nothing ? yl_label : "",
         )
@@ -369,47 +593,54 @@ function plot_datasets(datasets::Vector;
             right_chs = _maybe_smooth(_resolve_channels(data, ch_spec[2]), smoothing)
             panel_left_chs[i] = left_chs
             panel_right_chs[i] = right_chs
-            
-            yr_label = if ylabels !== nothing && i <= length(ylabels) && isa(ylabels[i], Tuple)
-                ylabels[i][2]
+
+            if isempty(right_chs)
+                push!(right_axes, nothing)
+                colors = _pick_colors(length(left_chs))
+                _plot_on_axis!(ax, left_chs, colors, 0)
+                axislegend(ax, position=:lt)
             else
-                ""
-            end
-            
-            ax_right = backend.Axis(fig[i, 1];
-                ylabel = yr_label !== nothing ? yr_label : "",
-                yaxisposition = :right,
-                xticklabelsvisible = false,
-                xticksvisible = false,
-                xlabelvisible = false,
-            )
-            backend.hidexdecorations!(ax_right)
-            backend.linkxaxes!(ax, ax_right)
-            push!(right_axes, ax_right)
-            
-            total = length(left_chs) + length(right_chs)
-            colors = _pick_colors(total)
-            
-            left_entries = _plot_on_axis!(backend, ax, left_chs, colors, 0)
-            right_entries = _plot_on_axis!(backend, ax_right, right_chs, colors, length(left_chs))
-            
-            if !isempty(left_entries)
-                backend.Legend(fig[i, 1],
-                    [e[1] for e in left_entries],
-                    [e[2] for e in left_entries],
-                    tellwidth=false, tellheight=false,
-                    halign=:left, valign=:top,
-                    margin=(10, 10, 10, 10),
+                yr_label = if ylabels !== nothing && i <= length(ylabels) && isa(ylabels[i], Tuple)
+                    ylabels[i][2]
+                else
+                    ""
+                end
+
+                ax_right = Axis(fig[i, 1];
+                    ylabel = yr_label !== nothing ? yr_label : "",
+                    yaxisposition = :right,
+                    xticklabelsvisible = false,
+                    xticksvisible = false,
+                    xlabelvisible = false,
                 )
-            end
-            if !isempty(right_entries)
-                backend.Legend(fig[i, 1],
-                    [e[1] for e in right_entries],
-                    [e[2] for e in right_entries],
-                    tellwidth=false, tellheight=false,
-                    halign=:right, valign=:top,
-                    margin=(10, 10, 10, 10),
-                )
+                hidexdecorations!(ax_right)
+                linkxaxes!(ax, ax_right)
+                push!(right_axes, ax_right)
+
+                total = length(left_chs) + length(right_chs)
+                colors = _pick_colors(total)
+
+                left_entries = _plot_on_axis!(ax, left_chs, colors, 0)
+                right_entries = _plot_on_axis!(ax_right, right_chs, colors, length(left_chs))
+            
+                if !isempty(left_entries)
+                    Legend(fig[i, 1],
+                        [e[1] for e in left_entries],
+                        [e[2] for e in left_entries],
+                        tellwidth=false, tellheight=false,
+                        halign=:left, valign=:top,
+                        margin=(10, 10, 10, 10),
+                    )
+                end
+                if !isempty(right_entries)
+                    Legend(fig[i, 1],
+                        [e[1] for e in right_entries],
+                        [e[2] for e in right_entries],
+                        tellwidth=false, tellheight=false,
+                        halign=:right, valign=:top,
+                        margin=(10, 10, 10, 10),
+                    )
+                end
             end
         else
             push!(right_axes, nothing)
@@ -419,33 +650,49 @@ function plot_datasets(datasets::Vector;
             panel_right_chs[i] = Channel[]
             
             colors = _pick_colors(length(selected_channels))
-            _plot_on_axis!(backend, ax, selected_channels, colors, 0)
-            backend.axislegend(ax, position=:rt)
-        end
-    end
-    
-    # Link x-axes across all left panels
-    if n_datasets > 1
-        for i in 2:n_datasets
-            backend.linkxaxes!(left_axes[1], left_axes[i])
-        end
-    end
-    # Hide x decorations on all but last panel
-    for i in 1:(n_datasets - 1)
-        backend.hidexdecorations!(left_axes[i]; label=true, ticklabels=true, ticks=false, grid=false)
-    end
-    
-    # Apply xlims
-    if xlims !== nothing
-        for ax in left_axes
-            backend.xlims!(ax, xlims)
-        end
-        for ax in right_axes
-            ax !== nothing && backend.xlims!(ax, xlims)
+            _plot_on_axis!(ax, selected_channels, colors, 0)
+            axislegend(ax, position=:lt)
         end
     end
 
-    # Apply ylims
+    stag = _smoothing_label(smoothing)
+    if !isempty(stag)
+        savepath = savepath !== nothing ? _append_to_filename(savepath, stag) : nothing
+        left_axes[1].title[] = stag
+    end
+    
+    if n_datasets > 1
+        # Find first non-heatmap axis to use as link reference
+        ref_idx = findfirst(i -> !(resolved_datasets[i] isa SMPSData), 1:n_datasets)
+        if ref_idx !== nothing
+            for i in 1:n_datasets
+                i == ref_idx && continue
+                resolved_datasets[i] isa SMPSData && continue
+                linkxaxes!(left_axes[ref_idx], left_axes[i])
+            end
+        end
+    end
+
+    for i in 1:(n_datasets - 1)
+        resolved_datasets[i] isa SMPSData && continue
+        hidexdecorations!(left_axes[i]; label=true, ticklabels=true, ticks=false, grid=false)
+    end
+    
+    if xlims !== nothing
+        epoch = DateTime(1970, 1, 1)
+        for (i, ax) in enumerate(left_axes)
+            if resolved_datasets[i] isa SMPSData
+                xl_ms = (Float64(Dates.value(xlims[1])), Float64(Dates.value(xlims[2])))
+                Makie.xlims!(ax, xl_ms)
+            else
+                Makie.xlims!(ax, xlims)
+            end
+        end
+        for ax in right_axes
+            ax !== nothing && Makie.xlims!(ax, xlims)
+        end
+    end
+
     ylims_vec = if ylims === nothing
         [nothing for _ in 1:n_datasets]
     elseif isa(ylims, AbstractVector)
@@ -455,16 +702,26 @@ function plot_datasets(datasets::Vector;
     end
     
     for (i, ax_left) in enumerate(left_axes)
+        # Skip ylims for heatmap panels — handled by the heatmap itself
+        resolved_datasets[i] isa SMPSData && continue
+
         ax_right = right_axes[i]
         is_dual = ax_right !== nothing
         left_yl, right_yl = _parse_panel_ylims(ylims_vec[i], is_dual)
         
-        _apply_ylims!(backend, ax_left, left_yl, panel_left_chs[i], xlims)
+        _apply_ylims!(ax_left, left_yl, panel_left_chs[i], xlims)
         if ax_right !== nothing
-            _apply_ylims!(backend, ax_right, right_yl, panel_right_chs[i], xlims)
+            _apply_ylims!(ax_right, right_yl, panel_right_chs[i], xlims)
         end
     end
 
-    savepath !== nothing && backend.save(savepath, fig, px_per_unit=PLOT_PX_PER_UNIT)
-    return _present(fig; interactive=interactive)
+    stages_data, stage_label = _unpack_stages(stages)
+    if stages_data !== nothing
+        for ax in left_axes
+            _draw_stages!(ax, stages; xlims=xlims)
+        end
+    end
+
+    savepath !== nothing && save(savepath, fig, px_per_unit=PLOT_PX_PER_UNIT)
+    return _present(fig; interactive=interactive, savepath=savepath)
 end
