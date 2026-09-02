@@ -22,3 +22,12 @@ function load_data_old(filepath::String)
 
     return Dataset(channels)
 end
+
+function merge_log_files(filepaths::Vector{String}, output_path::String)
+    open(output_path, "w") do out
+        for f in filepaths
+            write(out, read(f, String))
+            write(out, "\n")
+        end
+    end
+end
